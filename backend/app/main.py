@@ -14,7 +14,7 @@ app = FastAPI(
     version=settings.app_version,
 )
 
-# Enable CORS for the React dashboard frontend
+# Enable CORS for local and production Vercel frontend deployments
 origins = [origin.strip() for origin in settings.frontend_urls.split(",") if origin.strip()]
 for default_origin in ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3001", "http://127.0.0.1:3001"]:
     if default_origin not in origins:
@@ -22,7 +22,7 @@ for default_origin in ["http://localhost:3000", "http://127.0.0.1:3000", "http:/
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins else ["*"],
+    allow_origins=["*"],  # Allow production Vercel deployments and local frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
