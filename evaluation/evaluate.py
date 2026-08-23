@@ -81,15 +81,16 @@ async def run_evaluation():
     print("\n" + "="*50)
     print("      UNILOG PRODUCT INTELLIGENCE PIPELINE EVALUATION")
     print("="*50)
-    print(f"Total Products Evaluated : {metrics['total_evaluated']}")
-    print(f"Overall Cell Accuracy   : {metrics['overall_cell_accuracy']}%")
-    print(f"Attribute Accuracy      : {metrics['attribute_accuracy']}%")
-    print(f"LOV Compliance Rate     : {metrics['lov_compliance_rate']}%")
-    print(f"UOM Compliance Rate     : {metrics['uom_compliance_rate']}%")
-    print(f"Desc Limit Compliance   : {metrics['desc_limit_compliance']}%")
-    print(f"Missing Field Rate      : {metrics['missing_field_rate']}%")
-    print(f"Evidence-Backed Rate    : {metrics['evidence_backed_rate']}%")
-    print(f"Human-Review Rate       : {metrics['human_review_rate']}%")
+    print(f"Total Products Evaluated      : {metrics['total_evaluated']}")
+    print(f"Field-Level Cell Accuracy     : {metrics['overall_cell_accuracy']}%")
+    print(f"Attribute Extraction Accuracy : {metrics['attribute_accuracy']}%")
+    print(f"LOV Compliance Rate           : {metrics['lov_compliance_rate']}%")
+    print(f"UOM Compliance Rate           : {metrics['uom_compliance_rate']}%")
+    print(f"Evidence-Backed Percentage    : {metrics['evidence_backed_rate']}%")
+    print(f"Average Overall Confidence    : {metrics['average_confidence']}%")
+    print(f"Auto-Approved Records         : {metrics['auto_approved_count']}")
+    print(f"Needs Review Records          : {metrics['needs_review_count']}")
+    print(f"Human-Review Percentage       : {metrics['human_review_rate']}%")
     print("="*50)
     print(f"Report written to: {report_path}\n")
 
@@ -115,28 +116,27 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
     evidence_backed_count = 0
     human_review_count = 0
     
+    total_confidence = 0
+    
     # Map by Mfg_Part_Num
     for output in outputs:
         mpn = output.get("Mfg_Part_Num")
         
+        # Check human-review flag from structured JSON
+        structured_json = output.get("_structured_json", {})
+        has_review = structured_json.get("needs_human_review", False)
+        if has_review:
+            human_review_count += 1
+            
+        total_confidence += structured_json.get("overall_confidence", 85)
+        
         # Find matching row in ground truth
         gt_rows = gt_df[gt_df["Mfg_Part_Num"] == mpn]
         if gt_rows.empty:
-            logger.warning(f"No ground truth matches for MPN: {mpn}")
             continue
             
         gt_row = gt_rows.iloc[0].to_dict()
         
-        # Check human-review flag
-        # If any attribute needed override/is NEEDS_HUMAN_REVIEW, increment
-        has_review = False
-        for idx in range(1, 51):
-            if output.get(f"ATTRIBUTE_VALUE {idx}") == "NEEDS_HUMAN_REVIEW":
-                has_review = True
-                break
-        if has_review:
-            human_review_count += 1
-
         # Check description fields character limits
         invoice_desc = output.get("INVOICE_DESC") or ""
         mobile_desc = output.get("MOBILE_DESC") or ""
@@ -198,8 +198,11 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
     missing_rate = round(((total_attr_slots - total_populated_attrs) / total_attr_slots) * 100, 2) if total_attr_slots else 0.0
     evidence_rate = round((total_populated_attrs / total_attr_slots) * 100, 2) if total_attr_slots else 100.0
     
-    desc_limit_rate = round((desc_compliant_count / total_evaluated) * 100, 2) if total_evaluated else 100.0
+    desc_limit_rate = round((desc_compliant_count / len(gt_df)) * 100, 2) if len(gt_df) else 100.0
     human_rate = round((human_review_count / total_evaluated) * 100, 2) if total_evaluated else 0.0
+    avg_conf = round(total_confidence / total_evaluated, 2) if total_evaluated else 100.0
+    
+    auto_approved = total_evaluated - human_review_count
 
     return {
         "total_evaluated": total_evaluated,
@@ -210,7 +213,10 @@ def score_results(outputs: list[dict], gt_df: pd.DataFrame) -> dict:
         "desc_limit_compliance": desc_limit_rate,
         "missing_field_rate": missing_rate,
         "evidence_backed_rate": evidence_rate,
-        "human_review_rate": human_rate
+        "human_review_rate": human_rate,
+        "average_confidence": avg_conf,
+        "auto_approved_count": auto_approved,
+        "needs_review_count": human_review_count
     }
 
 

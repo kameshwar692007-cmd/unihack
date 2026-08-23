@@ -18,6 +18,13 @@ def test_login_works_with_default_dev_credentials() -> None:
 
 
 def test_signup_and_me_profile_flow() -> None:
+    from app.services.auth_store import USERS_FILE
+    if USERS_FILE.is_file():
+        try:
+            USERS_FILE.unlink()
+        except Exception:
+            pass
+            
     response = client.post(
         "/api/auth/signup",
         json={"username": "newanalyst", "email": "analyst@unilog.com", "password": "securepassword123"},

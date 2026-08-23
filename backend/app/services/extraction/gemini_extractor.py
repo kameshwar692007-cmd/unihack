@@ -22,7 +22,7 @@ class ExtractionResponse(BaseModel):
 
 
 class GeminiAttributeExtractor:
-    """Uses Gemini API to extract structured attributes from text chunks, with a heuristic fallback."""
+    """Uses Gemini API or a trained local classifier to extract structured attributes."""
 
     def __init__(self, api_key: str | None = None) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
@@ -39,6 +39,7 @@ class GeminiAttributeExtractor:
             except Exception as e:
                 logger.error(f"Failed to initialize Gemini client: {e}. Using mock mode.")
 
+<<<<<<< HEAD
 
 _default_extractor: GeminiAttributeExtractor | None = None
 
@@ -49,6 +50,19 @@ def get_gemini_extractor() -> GeminiAttributeExtractor:
         _default_extractor = GeminiAttributeExtractor()
     return _default_extractor
 
+=======
+        # Load the trained model checkpoint if available
+        self.model = None
+        try:
+            import joblib
+            from pathlib import Path
+            checkpoint_path = Path(__file__).resolve().parents[3] / "backend" / "data" / "trained_extractor.pkl"
+            if checkpoint_path.is_file():
+                self.model = joblib.load(checkpoint_path)
+                logger.info(f"Successfully loaded trained extractor model checkpoint from {checkpoint_path.name}")
+        except Exception as e:
+            logger.warning(f"Failed to load trained extractor model: {e}")
+>>>>>>> new-repo/main
 
     def extract_attributes(
         self,
@@ -58,9 +72,48 @@ def get_gemini_extractor() -> GeminiAttributeExtractor:
         allowed_attributes: List[str],
         retrieved_chunks: List[Dict[str, Any]],
     ) -> List[ExtractedAttribute]:
-        """Extract attributes from chunks using Gemini structured schema or heuristic fallback."""
+        """Extract attributes from chunks using Gemini, trained model, or heuristic fallback."""
         if not allowed_attributes:
             return []
+
+        # Try using the trained local classifier first (if loaded)
+        if self.model:
+            desc = product_desc or ""
+            extracted = []
+            attr_models = self.model.get("attr_models", {})
+            for attr_name in allowed_attributes:
+                m_info = attr_models.get(attr_name)
+                if not m_info:
+                    continue
+                
+                predicted_val = ""
+                conf = 0.95
+                if "majority" in m_info:
+                    predicted_val = m_info["majority"]
+                elif "vectorizer" in m_info and "classifier" in m_info:
+                    vec = m_info["vectorizer"]
+                    clf = m_info["classifier"]
+                    try:
+                        X_vec = vec.transform([desc])
+                        predicted_val = str(clf.predict(X_vec)[0])
+                        if hasattr(clf, "predict_proba"):
+                            proba = clf.predict_proba(X_vec)[0]
+                            classes = clf.classes_
+                            val_idx = list(classes).index(predicted_val)
+                            conf = float(proba[val_idx])
+                    except Exception:
+                        pass
+                        
+                if predicted_val and predicted_val.strip() != "":
+                    extracted.append(ExtractedAttribute(
+                        name=attr_name,
+                        value=predicted_val,
+                        confidence=conf,
+                        source_evidence=desc,
+                    ))
+            if len(extracted) > 0:
+                logger.info(f"Model-based attribute extraction succeeded for {mfg_part_num} (extracted {len(extracted)} attributes).")
+                return extracted
 
         # Check if classpath is Abrasives
         if classpath and "Abrasives" in classpath:
@@ -159,6 +212,23 @@ def get_gemini_extractor() -> GeminiAttributeExtractor:
                             
             if extracted:
                 return extracted
+
+        # Check if the evidence consists solely of the dummy placeholder text
+        is_dummy = False
+        if not retrieved_chunks:
+            is_dummy = True
+        else:
+            combined_chunks_text = " ".join([c.get("text", "") for c in retrieved_chunks]).strip()
+            if not combined_chunks_text:
+                is_dummy = True
+            elif "Specification sheet for manufacturer part number" in combined_chunks_text and len(combined_chunks_text) < 150:
+                is_dummy = True
+            elif combined_chunks_text == f"Specification sheet for manufacturer part number: {mfg_part_num}":
+                is_dummy = True
+
+        if is_dummy:
+            logger.info(f"Bypassing LLM call for {mfg_part_num} (no specification document available).")
+            return []
 
         evidence_text = "\n---\n".join([
             f"[Chunk from {chunk.get('source')} Page {chunk.get('page_num')}]: {chunk.get('text')}"

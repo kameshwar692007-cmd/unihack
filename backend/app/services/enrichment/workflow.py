@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import re
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, TypedDict, cast
 from langgraph.graph import StateGraph, END
 
@@ -675,28 +679,52 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
     for attr_name in allowed_attributes:
         value = validated.get(attr_name)
         has_val = bool(value) and str(value).strip() != "" and str(value).strip() != "NEEDS_HUMAN_REVIEW"
+        
+        # 1. LOV validation
+        lov_applicable = has_val and ref_service.has_lov_restrictions(state["classpath"], attr_name)
         lov_ok = has_val and ref_service.validate_lov_value(state["classpath"], attr_name, str(value))
-        uom_token = uoms.get(attr_name) or ""
-        uom_ok = has_val and (bool(uom_token) or ref_service.normalize_uom(str(value)) is None or not re.search(r"\d", str(value)))
+        
+        # 2. UOM validation
+        uom_suffix = uoms.get(attr_name) or ""
+        val_to_check = f"{str(value)} {uom_suffix}".strip() if has_val else None
+        is_uom, is_valid_uom = ref_service.validate_uom_value(val_to_check)
+        uom_applicable = is_uom
+        uom_ok = not is_uom or is_valid_uom
+        
         ev_text = evidence.get(attr_name, "")
         source_ok = has_val and bool(ev_text)
         
-        conf_val = float(confidence.get(attr_name, 0.95 if (has_val and lov_ok) else (0.5 if has_val else 0.0)))
+        raw_conf = float(confidence.get(attr_name, 0.95 if has_val else 0.0))
         
         if not has_val:
-            reason = "Specification not present in manufacturer documentation"
-        elif str(value) == "NEEDS_HUMAN_REVIEW" or attr_name in fields_needing_review:
-            reason = "Low confidence extraction - flagged for human review"
-        elif conf_val < 0.8:
-            reason = "Weak evidence signal / partial information match"
-        elif source_ok:
-            reason = f"Grounded in manufacturer evidence: '{ev_text[:60]}...'"
+            conf_val = 0.0
+            reason = "Missing attribute"
+        elif not source_ok:
+            conf_val = 0.50
+            reason = "Missing source evidence"
+        elif lov_applicable and not lov_ok:
+            conf_val = 0.60
+            reason = "LOV mismatch"
+        elif uom_applicable and not uom_ok:
+            conf_val = 0.70
+            reason = "UOM mismatch"
+        elif raw_conf < 0.8:
+            conf_val = raw_conf
+            reason = "Low extraction confidence"
         else:
-            reason = "Inferred from model series description & catalog guidelines"
-
+            conf_val = raw_conf
+            reason = "Grounded in manufacturer evidence"
+            
+        if attr_name in fields_needing_review:
+            conf_val = min(conf_val, 0.75)
+            if reason.startswith("Grounded"):
+                reason = "Low extraction confidence"
+        
         attribute_validation[attr_name] = {
             "lov": lov_ok,
+            "lov_applicable": lov_applicable,
             "uom": uom_ok,
+            "uom_applicable": uom_applicable,
             "source": source_ok,
             "confidence": conf_val,
             "reason": reason,
@@ -747,21 +775,78 @@ def final_output(state: EnrichmentState) -> Dict[str, Any]:
             "uom_status": uom_status
         })
         
-    overall_conf_scores = [a["confidence"] for a in attributes_list if a["confidence"] > 0]
-    overall_conf = int(sum(overall_conf_scores) / len(overall_conf_scores)) if overall_conf_scores else 78
+    # Calculate confidence values dynamically based on model extraction confidence, completeness, LOV, UOM, and evidence
+    populated_scores = [a["confidence"] for a in attributes_list if a["value"]]
+    avg_extraction_conf = (sum(populated_scores) / len(populated_scores)) if populated_scores else 95.0
     
-    needs_review = len(fields_needing_review) > 0
+    total_attrs = len(allowed_attributes)
+    populated_count = len(populated_scores)
+    completeness_score = (populated_count / total_attrs) * 100 if total_attrs > 0 else 100.0
+    
+    lov_applicable = [a for a in attributes_list if a["lov_status"] in {"compliant", "non_compliant"}]
+    lov_compliant = [a for a in lov_applicable if a["lov_status"] == "compliant"]
+    lov_validity = (len(lov_compliant) / len(lov_applicable)) * 100 if lov_applicable else 100.0
+    
+    uom_applicable = [a for a in attributes_list if a["uom_status"] in {"compliant", "non_compliant"}]
+    uom_compliant = [a for a in uom_applicable if a["uom_status"] == "compliant"]
+    uom_validity = (len(uom_compliant) / len(uom_applicable)) * 100 if uom_applicable else 100.0
+    
+    evidence_count = sum(1 for a in attributes_list if a["value"] and a["evidence"])
+    source_evidence_score = (evidence_count / populated_count) * 100 if populated_count > 0 else 100.0
+    
+    mfr_match_score = 100.0
+    mfr_matched_confidently = True
+    if not mfr_val:
+        mfr_match_score = 0.0
+        mfr_matched_confidently = False
+    elif inp.get("part_manuf") and mfr_val.lower() not in str(inp.get("part_manuf")).lower():
+        mfr_match_score = 60.0
+        mfr_matched_confidently = False
+
+    overall_conf = int(
+        (avg_extraction_conf * 0.3) +
+        (lov_validity * 0.2) +
+        (uom_validity * 0.2) +
+        (completeness_score * 0.1) +
+        (source_evidence_score * 0.1) +
+        (mfr_match_score * 0.1)
+    )
+    overall_conf = max(0, min(100, overall_conf))
+    
+    needs_review = False
     review_reason_list = []
-    if brand_source == "description_only":
-        review_reason_list.append("Brand extracted from description only")
-    if cp_conf < 100:
-        review_reason_list.append("Classpath confidence is below 100% due to keyword matching only")
-    non_compliant_attrs = [a["name"] for a in attributes_list if a["lov_status"] == "non_compliant"]
-    if non_compliant_attrs:
-        review_reason_list.append("Attribute values marked as non_compliant for LOV as verification against master LOV file is required")
-    missing_essential = [a["name"] for a in attributes_list if a["confidence"] == 0]
-    if missing_essential:
-        review_reason_list.append("Essential attributes are missing")
+    
+    if not mfr_matched_confidently:
+        needs_review = True
+        review_reason_list.append("Manufacturer could not be confidently matched")
+    
+    # 1. Overall confidence score below threshold (80)
+    if overall_conf < 80:
+        needs_review = True
+        review_reason_list.append(f"Overall confidence score ({overall_conf}%) is below the 80% threshold")
+        
+    # 2. LOV validation fails
+    non_compliant_lov = [a["name"] for a in attributes_list if a["lov_status"] == "non_compliant"]
+    if non_compliant_lov:
+        needs_review = True
+        review_reason_list.append(f"LOV validation failed for: {', '.join(non_compliant_lov)}")
+        
+    # 3. UOM validation fails
+    non_compliant_uom = [a["name"] for a in attributes_list if a["uom_status"] == "non_compliant"]
+    if non_compliant_uom:
+        needs_review = True
+        review_reason_list.append(f"UOM validation failed for: {', '.join(non_compliant_uom)}")
+        
+    # 4. Source evidence is missing for a populated/enriched attribute
+    missing_source_attrs = [a["name"] for a in attributes_list if a["normalized_value"] and not a["evidence"]]
+    if missing_source_attrs:
+        needs_review = True
+        review_reason_list.append(f"Missing source evidence for attributes: {', '.join(missing_source_attrs)}")
+        
+    # 5. Missing required identifiers
+    if not mfr_val or not cp_val:
+        needs_review = True
+        review_reason_list.append("Missing required identifiers: Manufacturer or Classpath")
         
     review_reason_str = "; ".join(review_reason_list) if review_reason_list else "All checks passed."
     
@@ -853,9 +938,53 @@ def build_enrichment_graph():
 
 _graph_instance = None
 _enrich_cache = {}
+_cache_loaded = False
+_cache_lock = threading.Lock()
+CACHE_FILE = Path(__file__).resolve().parents[3] / "data" / "enrich_cache.json"
+
+def _load_cache():
+    global _enrich_cache
+    if CACHE_FILE.is_file():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            loaded_entries = {}
+            for k, v in data.items():
+                try:
+                    tuple_key = tuple(json.loads(k))
+                    loaded_entries[tuple_key] = v
+                except Exception:
+                    pass
+            
+            with _cache_lock:
+                _enrich_cache.update(loaded_entries)
+                
+            logger.info(f"Loaded {len(loaded_entries)} cached entries from {CACHE_FILE.name}")
+        except Exception as e:
+            logger.warning(f"Failed to load cache: {e}")
+
+def _save_cache():
+    import traceback
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Thread-safe copy of cache items for serialization
+        with _cache_lock:
+            cache_items = copy.deepcopy(list(_enrich_cache.items()))
+        serializable = {json.dumps(k): v for k, v in cache_items}
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved {len(cache_items)} cached entries to {CACHE_FILE.name}")
+    except Exception as e:
+        logger.warning(f"Failed to save cache: {e}\n{traceback.format_exc()}")
 
 def enrich_product(product: ProductInput) -> dict[str, Any]:
     """Execute LangGraph enrichment pipeline on a single catalog product input."""
+    global _cache_loaded
+    if not _cache_loaded:
+        _load_cache()
+        _cache_loaded = True
+
     cache_key = (
         product.mfg_part_num,
         product.part_desc,
@@ -867,8 +996,13 @@ def enrich_product(product: ProductInput) -> dict[str, Any]:
         product.ref_url_1,
         product.ref_url_2,
     )
-    if cache_key in _enrich_cache:
-        return _enrich_cache[cache_key]
+    with _cache_lock:
+        in_cache = cache_key in _enrich_cache
+        if in_cache:
+            cached_val = _enrich_cache[cache_key]
+            
+    if in_cache:
+        return cached_val
 
     global _graph_instance
     if _graph_instance is None:
@@ -917,5 +1051,7 @@ def enrich_product(product: ProductInput) -> dict[str, Any]:
     
     result = _graph_instance.invoke(state_input)
     output = result["final_output"]
-    _enrich_cache[cache_key] = output
+    with _cache_lock:
+        _enrich_cache[cache_key] = copy.deepcopy(output)
+    _save_cache()
     return output

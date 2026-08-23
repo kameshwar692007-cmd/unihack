@@ -746,3 +746,60 @@ def _as_decimal(value: Any) -> Decimal | None:
 
 def _quantize(value: Decimal) -> Decimal:
     return value.quantize(DECIMAL_QUANT).normalize()
+
+
+def has_lov_restrictions(classpath: str | None, label: str | None) -> bool:
+    if not classpath or not label:
+        return False
+    service = get_reference_service()
+    try:
+        allowed = service.get_allowed_values(classpath, label)
+        return len(allowed) > 0
+    except Exception:
+        return False
+
+
+def validate_uom_value(val_str: str | None) -> tuple[bool, bool]:
+    """Returns (is_numeric_uom, is_valid) based on number token and approved units."""
+    if val_str is None:
+        return False, False
+    val_str = str(val_str).strip()
+    if not val_str or val_str == "NEEDS_HUMAN_REVIEW":
+        return False, False
+        
+    # Must contain a number/digit to represent a potential quantity/measurement
+    if not re.search(r"\d", val_str):
+        return False, False
+        
+    # Parse initial numeric component (integers, floats, simple fractions, mixed fractions)
+    num_pattern = r"^[-+]?(?:\d+-\d+/\d+|\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)"
+    match = re.match(num_pattern, val_str)
+    if not match:
+        return False, False
+        
+    num_part = match.group(0)
+    unit_part = val_str[len(num_part):].strip()
+    
+    if not unit_part:
+        # A number without a UOM suffix is a pure number/count, not a UOM field
+        return False, False
+        
+    # Check standard abbreviations
+    if unit_part in {'"', "in", "inch", "inches", "V", "A", "dBA", "W", "Hz", "lbs", "psi", "gpm", "RPM"}:
+        return True, True
+        
+    service = get_reference_service()
+    try:
+        catalog = service._ensure_catalog()
+        if _lookup_key(unit_part) in catalog.uom_by_term:
+            return True, True
+    except Exception:
+        pass
+        
+    try:
+        if service.normalize_uom(val_str) is not None:
+            return True, True
+    except Exception:
+        pass
+        
+    return True, False

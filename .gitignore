@@ -42,3 +42,5 @@ build/
 *.zip
 tmp/
 
+
+backend/data/enrich_cache.json
