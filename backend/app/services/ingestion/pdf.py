@@ -89,90 +89,14 @@ class PDFProcessor:
     def _process_pdf_raw(cls, path: Path) -> List[PDFElement]:
         elements: List[PDFElement] = []
         
-        # Try using Docling first
-        try:
-            from docling.document_converter import DocumentConverter
-            logger.info(f"Processing {path.name} using Docling...")
-            
-            converter = DocumentConverter()
-            result = converter.convert(str(path))
-            
-            # Exported document has nodes
-            doc = result.document
-            doc_metadata = getattr(doc, "metadata", None)
-            document_metadata = {
-                "source": path.name,
-                "document_title": getattr(doc_metadata, "title", None) if doc_metadata else None,
-                "document_author": getattr(doc_metadata, "author", None) if doc_metadata else None,
-            }
-            document_metadata = {key: value for key, value in document_metadata.items() if value}
-            
-            # Iterate through the document elements/nodes
-            for element, level in doc.iterate_items():
-                # Extract page number (Docling 2.x uses prov / page_no or similar)
-                page_num = 1
-                if hasattr(element, "prov") and element.prov:
-                    page_num = element.prov[0].page_no if hasattr(element.prov[0], "page_no") else 1
-                elif hasattr(element, "pages") and element.pages:
-                    # In some versions it has element.pages list
-                    page_num = element.pages[0] if isinstance(element.pages[0], int) else 1
-                
-                # Check for tables
-                text = ""
-                element_type = "paragraph"
-                
-                # Let's detect table
-                from docling_core.types.doc.document import TableItem
-                metadata = dict(document_metadata)
-                provenance = getattr(element, "prov", None) or []
-                metadata["provenance"] = [
-                    {
-                        "page_num": getattr(item, "page_no", None),
-                        "bbox": str(getattr(item, "bbox", "")) if getattr(item, "bbox", None) else None,
-                    }
-                    for item in provenance
-                ]
-                if isinstance(element, TableItem):
-                    element_type = "table"
-                    # Render table to markdown/csv text if possible
-                    text = element.export_to_markdown() if hasattr(element, "export_to_markdown") else str(element)
-                    metadata["table_id"] = getattr(element, "self_ref", None)
-                    metadata["table_data"] = text
-                elif element.__class__.__name__ in {"HeadingItem", "SectionHeaderItem"}:
-                    element_type = "heading"
-                    text = element.text if hasattr(element, "text") else str(element)
-                else:
-                    text = element.text if hasattr(element, "text") else str(element)
-
-                if text.strip():
-                    elements.append(
-                        PDFElement(
-                            text=text.strip(),
-                            page_num=page_num,
-                            element_type=element_type,
-                            metadata=metadata
-                        )
-                    )
-            
-            if elements:
-                logger.info(f"Loaded {len(elements)} elements using Docling from {path.name}")
-                return chunk_pdf_elements(elements)
-
-        except Exception as e:
-            logger.warning(f"Docling processing failed for {path.name} ({e}). Falling back to PyPDF...")
-
-        # Fallback to PyPDF
+        # Fast-track using PyPDF first for high performance
         try:
             import pypdf
             reader = pypdf.PdfReader(path)
             for page_idx, page in enumerate(reader.pages):
                 page_num = page_idx + 1
                 text = page.extract_text()
-                
-                # If there are tables in the page, plain extract_text might merge columns, 
-                # but it still extracts the text.
                 if text and text.strip():
-                    # We split page content by double newline to form paragraph-like chunks
                     paragraphs = text.split("\n\n")
                     for p in paragraphs:
                         clean_p = p.strip()
@@ -182,14 +106,33 @@ class PDFProcessor:
                                     text=clean_p,
                                     page_num=page_num,
                                     element_type="paragraph",
-                                    metadata={"source": path.name, "fallback": True}
+                                    metadata={"source": path.name, "fallback": False}
                                 )
                             )
             if elements:
-                logger.info(f"Loaded {len(elements)} elements using PyPDF fallback from {path.name}")
+                logger.info(f"Loaded {len(elements)} elements using fast PyPDF from {path.name}")
                 return chunk_pdf_elements(elements)
-        except Exception as fallback_err:
-            logger.warning(f"PyPDF fallback encountered issue for {path.name}: {fallback_err}")
+        except Exception as pypdf_err:
+            logger.warning(f"PyPDF issue for {path.name}: {pypdf_err}")
+
+        # Fallback to Docling if installed
+        try:
+            from docling.document_converter import DocumentConverter
+            logger.info(f"Processing {path.name} using Docling fallback...")
+            converter = DocumentConverter()
+            result = converter.convert(str(path))
+            doc = result.document
+            for element, level in doc.iterate_items():
+                page_num = 1
+                if hasattr(element, "prov") and element.prov:
+                    page_num = element.prov[0].page_no if hasattr(element.prov[0], "page_no") else 1
+                text = element.text if hasattr(element, "text") else str(element)
+                if text.strip():
+                    elements.append(PDFElement(text=text.strip(), page_num=page_num, element_type="paragraph"))
+            if elements:
+                return chunk_pdf_elements(elements)
+        except Exception as docling_err:
+            logger.warning(f"Docling fallback skipped: {docling_err}")
 
         # Emergency raw text extraction fallback for synthetic/minimal PDFs
         try:

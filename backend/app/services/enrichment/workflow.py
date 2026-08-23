@@ -8,7 +8,7 @@ from langgraph.graph import StateGraph, END
 from app.models.product_input import ProductInput
 from app.services.retrieval import reference as ref_service
 from app.services.retrieval.qdrant_db import get_qdrant_service
-from app.services.extraction.gemini_extractor import GeminiAttributeExtractor, ExtractedAttribute
+from app.services.extraction.gemini_extractor import get_gemini_extractor, GeminiAttributeExtractor, ExtractedAttribute
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ class EnrichmentState(TypedDict):
 
 # Nodes
 
+# In-memory LRU caches for reference lookups across batch rows
+_MFR_LOOKUP_CACHE: Dict[str, str | None] = {}
+_BRAND_LOOKUP_CACHE: Dict[str, str | None] = {}
+
 def resolve_product(state: EnrichmentState) -> Dict[str, Any]:
     """1. Resolve product identity against master catalog lookups."""
     logger.info("Node: resolve_product")
@@ -67,22 +71,30 @@ def resolve_product(state: EnrichmentState) -> Dict[str, Any]:
     mfg_part_num = inp.get("mfg_part_num")
     part_desc = inp.get("part_desc")
 
-    # Call ReferenceDataService to resolve manufacturer name
-    canonical_mfr = ref_service.find_manufacturer(part_manuf)
-    if not canonical_mfr and part_manuf:
-        canonical_mfr = part_manuf.strip()
+    # Call ReferenceDataService to resolve manufacturer name (with in-memory cache)
+    cache_key_mfr = (part_manuf or "").strip()
+    if cache_key_mfr in _MFR_LOOKUP_CACHE:
+        canonical_mfr = _MFR_LOOKUP_CACHE[cache_key_mfr]
+    else:
+        canonical_mfr = ref_service.find_manufacturer(part_manuf)
+        if not canonical_mfr and part_manuf:
+            canonical_mfr = part_manuf.strip()
+        _MFR_LOOKUP_CACHE[cache_key_mfr] = canonical_mfr
 
-    # Search brands in order of input columns
-    canonical_brand = None
-    for brand_candidate in [e1_brand, unilog_brand, dib_brand]:
-        if brand_candidate:
-            canonical_brand = ref_service.find_brand(brand_candidate, manufacturer=canonical_mfr)
-            if canonical_brand:
-                break
-    
-    if not canonical_brand and canonical_mfr:
-        # Default brand is the manufacturer name as per ground-truth instruction
-        canonical_brand = canonical_mfr
+    # Search brands in order of input columns (with in-memory cache)
+    brand_cache_key = f"{canonical_mfr}|{e1_brand}|{unilog_brand}|{dib_brand}"
+    if brand_cache_key in _BRAND_LOOKUP_CACHE:
+        canonical_brand = _BRAND_LOOKUP_CACHE[brand_cache_key]
+    else:
+        canonical_brand = None
+        for brand_candidate in [e1_brand, unilog_brand, dib_brand]:
+            if brand_candidate:
+                canonical_brand = ref_service.find_brand(brand_candidate, manufacturer=canonical_mfr)
+                if canonical_brand:
+                    break
+        if not canonical_brand and canonical_mfr:
+            canonical_brand = canonical_mfr
+        _BRAND_LOOKUP_CACHE[brand_cache_key] = canonical_brand
 
     # Determine classpath: Since our input deals with built-in dishwashers, we check description 
     # to associate with standard classpath
@@ -151,8 +163,8 @@ def extract_attributes(state: EnrichmentState) -> Dict[str, Any]:
     classpath = state["classpath"]
     allowed_attributes = ref_service.get_allowed_attributes(classpath)
     
-    # Use Gemini extractor
-    extractor = GeminiAttributeExtractor()
+    # Use Gemini extractor (cached singleton)
+    extractor = get_gemini_extractor()
     extracted = extractor.extract_attributes(
         product_desc=state["part_desc"] or "",
         mfg_part_num=state["mfg_part_num"] or "",

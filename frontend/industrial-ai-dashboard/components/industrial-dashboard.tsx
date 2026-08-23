@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -8,6 +8,7 @@ import {
   BarChart3,
   Bell,
   Boxes,
+  Camera,
   CheckCircle2,
   ChevronRight,
   ClipboardCheck,
@@ -20,6 +21,7 @@ import {
   Info,
   Layers3,
   ListChecks,
+  Loader2,
   LogOut,
   Menu,
   Moon,
@@ -54,6 +56,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import {
   approveReview,
+  cancelJob,
   evidencePdfUrl,
   exportUrl,
   getCurrentUser,
@@ -406,6 +409,7 @@ function ConnectedPipelineView({
 }) {
   const [job, setJob] = useState<Job | null>(null)
   const [error, setError] = useState('')
+  const [cancelling, setCancelling] = useState(false)
 
   useEffect(() => {
     if (!jobId) return
@@ -421,12 +425,24 @@ function ConnectedPipelineView({
       }
     }
     void poll()
-    const timer = window.setInterval(() => void poll(), 1500)
+    const timer = window.setInterval(() => void poll(), 1000)
     return () => {
       active = false
       window.clearInterval(timer)
     }
   }, [jobId, onCompleted])
+
+  async function handleCancel() {
+    if (!jobId || cancelling) return
+    setCancelling(true)
+    try {
+      await cancelJob(jobId)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Could not cancel job.')
+    } finally {
+      setCancelling(false)
+    }
+  }
 
   const progress = job && job.total_rows ? Math.round((job.processed_rows / job.total_rows) * 100) : 0
 
@@ -441,6 +457,10 @@ function ConnectedPipelineView({
             <Button size="sm" onClick={onViewResults}>
               <Boxes className="mr-1.5 size-3.5" /> View Results
             </Button>
+          ) : job?.status === 'running' ? (
+            <Button size="sm" variant="destructive" onClick={() => void handleCancel()} disabled={cancelling}>
+              <XCircle className="mr-1.5 size-3.5" /> {cancelling ? 'Cancelling...' : 'Cancel Processing'}
+            </Button>
           ) : undefined
         }
       />
@@ -454,18 +474,35 @@ function ConnectedPipelineView({
               <div className="flex items-center justify-between">
                 <div>
                   <CardTitle className="text-sm font-bold">{job.filename}</CardTitle>
-                  <CardDescription className="text-xs">
-                    Job ID: {job.id} · {job.processed_rows} of {job.total_rows} rows processed
+                  <CardDescription className="text-xs font-mono">
+                    Job ID: {job.id} · Processing {job.processed_rows} / {job.total_rows} ({progress}%)
                   </CardDescription>
                 </div>
-                <StatusBadge tone={job.status === 'completed' ? 'success' : 'warning'}>{job.status}</StatusBadge>
+                <StatusBadge tone={job.status === 'completed' ? 'success' : job.status === 'cancelled' || job.status === 'cancelling' ? 'danger' : 'warning'}>
+                  {job.status}
+                </StatusBadge>
               </div>
             </CardHeader>
-            <CardContent className="flex flex-col gap-3">
-              <Progress value={progress} className="h-2" />
-              <div className="flex justify-between font-mono text-xs text-muted-foreground">
-                <span>{progress}% complete</span>
-                <span>{job.needs_review_count} rows require human review</span>
+            <CardContent className="flex flex-col gap-4">
+              <Progress value={progress} className="h-2.5" />
+              
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 pt-1 font-mono text-xs">
+                <div className="rounded-lg border bg-muted/40 p-2.5 text-center">
+                  <div className="text-[10px] text-muted-foreground uppercase font-sans">Progress</div>
+                  <div className="text-base font-bold text-foreground mt-0.5">{progress}%</div>
+                </div>
+                <div className="rounded-lg border bg-emerald-500/10 border-emerald-500/30 p-2.5 text-center">
+                  <div className="text-[10px] text-emerald-600 dark:text-emerald-400 uppercase font-sans">Successful</div>
+                  <div className="text-base font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">{job.successful_rows ?? job.processed_rows}</div>
+                </div>
+                <div className="rounded-lg border bg-amber-500/10 border-amber-500/30 p-2.5 text-center">
+                  <div className="text-[10px] text-amber-600 dark:text-amber-400 uppercase font-sans">Needs Review</div>
+                  <div className="text-base font-bold text-amber-600 dark:text-amber-400 mt-0.5">{job.needs_review_count}</div>
+                </div>
+                <div className="rounded-lg border bg-rose-500/10 border-rose-500/30 p-2.5 text-center">
+                  <div className="text-[10px] text-rose-600 dark:text-rose-400 uppercase font-sans">Failed</div>
+                  <div className="text-base font-bold text-rose-600 dark:text-rose-400 mt-0.5">{job.failed_rows ?? 0}</div>
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -475,7 +512,7 @@ function ConnectedPipelineView({
               <CardTitle className="text-sm font-bold">Execution Log Stream</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-4 font-mono text-xs text-emerald-400 leading-6 border">
+              <div className="max-h-80 overflow-auto rounded-lg bg-zinc-950 p-4 font-mono text-xs text-emerald-400 leading-6 border border-zinc-800">
                 {job.logs.map((log, index) => (
                   <div key={`${index}-${log}`}>{log}</div>
                 ))}
@@ -510,16 +547,21 @@ function ConnectedResultsView({
   onSelectProduct: (mpn: string) => void
   onAddToCart: (product: ProductResult) => void
 }) {
+  const [initialResults, setInitialResults] = useState<ProductResult[]>([])
   const [results, setResults] = useState<ProductResult[]>([])
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'validated' | 'review'>('all')
   const [searching, setSearching] = useState(false)
   const [inspectProduct, setInspectProduct] = useState<ProductResult | null>(null)
+  
+  const searchCache = useRef<Map<string, ProductResult[]>>(new Map())
 
   useEffect(() => {
     if (!jobId) return
     void getResults(jobId)
       .then((data) => {
+        setInitialResults(data)
         setResults(data)
         if (selectedMpn) {
           const match = data.find((p) => String(p.PART_NUMBER ?? p.Mfg_Part_Num) === selectedMpn)
@@ -531,19 +573,42 @@ function ConnectedResultsView({
       .catch((err) => setError(err instanceof Error ? err.message : 'Could not load catalog results.'))
   }, [jobId, selectedMpn])
 
-  async function search() {
-    if (!query.trim()) return
-    setSearching(true)
-    setError('')
-    try {
-      const matches = await searchProducts(query, jobId ?? undefined)
-      setResults(matches.map((m) => m.product))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Search query failed.')
-    } finally {
-      setSearching(false)
+  // Debounced search trigger (300ms)
+  useEffect(() => {
+    const trimmed = query.trim()
+    if (!trimmed) {
+      setResults(initialResults)
+      return
     }
-  }
+
+    if (searchCache.current.has(trimmed)) {
+      setResults(searchCache.current.get(trimmed)!)
+      return
+    }
+
+    setSearching(true)
+    const handler = setTimeout(async () => {
+      try {
+        const matches = await searchProducts(trimmed, jobId ?? undefined)
+        const matchedProducts = matches.map((m) => m.product)
+        searchCache.current.set(trimmed, matchedProducts)
+        setResults(matchedProducts)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Search query failed.')
+      } finally {
+        setSearching(false)
+      }
+    }, 300)
+
+    return () => clearTimeout(handler)
+  }, [query, jobId, initialResults])
+
+  const filteredResults = useMemo(() => {
+    if (statusFilter === 'all') return results
+    if (statusFilter === 'validated') return results.filter((p) => !p._needs_human_review)
+    if (statusFilter === 'review') return results.filter((p) => p._needs_human_review)
+    return results
+  }, [results, statusFilter])
 
   return (
     <div className="flex flex-col gap-6">
@@ -583,22 +648,51 @@ function ConnectedResultsView({
         <Card className="border-border/60 bg-card/80 shadow-sm">
           <CardContent className="overflow-auto p-4">
             <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex flex-1 gap-2 max-w-lg">
-                <Input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') void search()
-                  }}
-                  placeholder="Search MPN, manufacturer, brand, or attribute..."
-                  className="h-9 text-xs"
-                />
-                <Button size="sm" onClick={() => void search()} disabled={searching || !query.trim()}>
-                  <Search className="mr-1.5 size-3.5" /> Search
-                </Button>
+              <div className="flex flex-1 items-center gap-2 max-w-lg relative">
+                <div className="relative w-full">
+                  <Input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search MPN, manufacturer, brand, or attribute (auto-debounced)..."
+                    className="h-9 text-xs pr-8"
+                  />
+                  {query && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="absolute right-1 top-1 size-7 text-muted-foreground hover:text-foreground"
+                      onClick={() => setQuery('')}
+                      title="Clear search"
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  )}
+                </div>
+                {searching && <Loader2 className="size-4 animate-spin text-primary shrink-0" />}
               </div>
 
-              <span className="font-mono text-xs text-muted-foreground">{results.length} records populated</span>
+              <div className="flex items-center gap-2">
+                <div className="flex rounded-lg border bg-muted/30 p-1 text-[11px] font-medium">
+                  <button
+                    onClick={() => setStatusFilter('all')}
+                    className={`px-2.5 py-1 rounded ${statusFilter === 'all' ? 'bg-primary text-primary-foreground font-bold' : 'text-muted-foreground'}`}
+                  >
+                    All ({results.length})
+                  </button>
+                  <button
+                    onClick={() => setStatusFilter('validated')}
+                    className={`px-2.5 py-1 rounded ${statusFilter === 'validated' ? 'bg-primary text-primary-foreground font-bold' : 'text-muted-foreground'}`}
+                  >
+                    Validated ({results.filter((r) => !r._needs_human_review).length})
+                  </button>
+                  <button
+                    onClick={() => setStatusFilter('review')}
+                    className={`px-2.5 py-1 rounded ${statusFilter === 'review' ? 'bg-primary text-primary-foreground font-bold' : 'text-muted-foreground'}`}
+                  >
+                    Needs Review ({results.filter((r) => r._needs_human_review).length})
+                  </button>
+                </div>
+              </div>
             </div>
 
             <Table>
@@ -613,7 +707,7 @@ function ConnectedResultsView({
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {results.map((product, index) => {
+                {filteredResults.map((product, index) => {
                   const attributes = Object.keys(product).filter((key) => key.startsWith('ATTRIBUTE_VALUE ') && product[key])
                   const mpn = String(product.Mfg_Part_Num ?? product.PART_NUMBER ?? '')
                   return (
@@ -1070,6 +1164,219 @@ function ConnectedMetricsView() {
 // ----------------------------------------------------
 // MAIN INDUSTRIAL DASHBOARD SHELL
 // ----------------------------------------------------
+function ScanSearchModal({
+  open,
+  onClose,
+  onSearchResult,
+}: {
+  open: boolean
+  onClose: () => void
+  onSearchResult: (mpn: string, jobId?: string) => void
+}) {
+  const [tab, setTab] = useState<'camera' | 'upload'>('camera')
+  const [cameraActive, setCameraActive] = useState(false)
+  const [cameraError, setCameraError] = useState('')
+  const [scanning, setScanning] = useState(false)
+  const [extractedQuery, setExtractedQuery] = useState('')
+  const [emptyMatchError, setEmptyMatchError] = useState('')
+
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+
+  useEffect(() => {
+    if (!open) {
+      stopCamera()
+      return
+    }
+    if (tab === 'camera') {
+      void startCamera()
+    } else {
+      stopCamera()
+    }
+    return () => stopCamera()
+  }, [open, tab])
+
+  function stopCamera() {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+    setCameraActive(false)
+  }
+
+  async function startCamera() {
+    setCameraError('')
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera device access not supported.')
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      })
+      streamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        void videoRef.current.play()
+      }
+      setCameraActive(true)
+    } catch {
+      setCameraError('Camera access unavailable or denied. Using file upload mode.')
+      setTab('upload')
+      stopCamera()
+    }
+  }
+
+  async function handleProcessFile(imageFile: File) {
+    setScanning(true)
+    setEmptyMatchError('')
+    try {
+      const res = await scanSearch(imageFile)
+      setExtractedQuery(res.detected_code || '')
+      if (res.matches && res.matches.length > 0) {
+        onSearchResult(res.detected_code, res.matches[0].job_id)
+        onClose()
+      } else {
+        setEmptyMatchError(
+          `Detected token '${res.detected_code}', but no direct catalog record matched. Edit the search query below or search manually.`
+        )
+      }
+    } catch (err) {
+      setEmptyMatchError(err instanceof Error ? err.message : 'Vision scan parsing failed.')
+    } finally {
+      setScanning(false)
+    }
+  }
+
+  function captureSnapshot() {
+    if (!videoRef.current || !canvasRef.current) return
+    const video = videoRef.current
+    const canvas = canvasRef.current
+    canvas.width = video.videoWidth || 640
+    canvas.height = video.videoHeight || 480
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    canvas.toBlob((blob) => {
+      if (!blob) return
+      const snapshotFile = new File([blob], 'camera_snapshot.jpg', { type: 'image/jpeg' })
+      void handleProcessFile(snapshotFile)
+    }, 'image/jpeg')
+  }
+
+  function executeManualSearch() {
+    if (!extractedQuery.trim()) return
+    onSearchResult(extractedQuery.trim())
+    onClose()
+  }
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+      <Card className="w-full max-w-lg shadow-2xl bg-card border-border">
+        <CardHeader className="flex flex-row items-center justify-between pb-3 border-b">
+          <div className="flex items-center gap-2">
+            <QrCode className="size-5 text-primary" />
+            <CardTitle className="text-base font-bold">Scan-to-Search</CardTitle>
+          </div>
+          <Button variant="ghost" size="icon" className="size-7" onClick={onClose}><X className="size-4" /></Button>
+        </CardHeader>
+        <CardContent className="pt-4 space-y-4">
+          <div className="flex gap-2 border-b pb-2">
+            <Button
+              size="sm"
+              variant={tab === 'camera' ? 'default' : 'outline'}
+              className="text-xs h-8"
+              onClick={() => setTab('camera')}
+            >
+              <Camera className="mr-1.5 size-3.5" /> Live Camera
+            </Button>
+            <Button
+              size="sm"
+              variant={tab === 'upload' ? 'default' : 'outline'}
+              className="text-xs h-8"
+              onClick={() => setTab('upload')}
+            >
+              <CloudUpload className="mr-1.5 size-3.5" /> File Upload Mode
+            </Button>
+          </div>
+
+          {cameraError && (
+            <Alert variant="destructive" className="py-2 text-xs">
+              <AlertTriangle className="size-3.5" />
+              <AlertDescription>{cameraError}</AlertDescription>
+            </Alert>
+          )}
+
+          {tab === 'camera' && (
+            <div className="flex flex-col items-center gap-3">
+              <div className="relative w-full h-56 bg-zinc-950 rounded-lg overflow-hidden border flex items-center justify-center">
+                <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+                <canvas ref={canvasRef} className="hidden" />
+                {scanning && (
+                  <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center gap-2 text-white">
+                    <Loader2 className="size-8 animate-spin text-primary" />
+                    <span className="text-xs font-semibold">Parsing vision model OCR...</span>
+                  </div>
+                )}
+              </div>
+              <Button className="w-full text-xs font-medium" onClick={captureSnapshot} disabled={scanning || !cameraActive}>
+                {scanning ? 'Scanning...' : 'Capture Snapshot & Search'}
+              </Button>
+            </div>
+          )}
+
+          {tab === 'upload' && (
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">Upload a photo of a barcode, product label, or datasheet to extract catalog part numbers.</p>
+              <Input
+                type="file"
+                accept="image/*"
+                className="text-xs"
+                onChange={(e) => {
+                  const selected = e.target.files?.[0] ?? null
+                  if (selected) void handleProcessFile(selected)
+                }}
+              />
+              {scanning && (
+                <div className="flex items-center gap-2 text-xs text-primary font-medium py-2">
+                  <Loader2 className="size-4 animate-spin" />
+                  <span>Processing document image with AI vision...</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {emptyMatchError && (
+            <Alert className="border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400 py-2.5 text-xs">
+              <AlertTriangle className="size-4 shrink-0" />
+              <AlertDescription>{emptyMatchError}</AlertDescription>
+            </Alert>
+          )}
+
+          {extractedQuery && (
+            <div className="rounded-lg border bg-muted/30 p-3 space-y-2">
+              <label className="text-[10px] font-bold uppercase text-muted-foreground">Extracted Search Code / MPN</label>
+              <div className="flex gap-2">
+                <Input
+                  value={extractedQuery}
+                  onChange={(e) => setExtractedQuery(e.target.value)}
+                  placeholder="Enter or modify product code..."
+                  className="h-8 text-xs font-mono"
+                />
+                <Button size="sm" className="h-8 text-xs" onClick={executeManualSearch} disabled={!extractedQuery.trim()}>
+                  <Search className="mr-1 size-3.5" /> Search Catalog
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 export default function IndustrialDashboard() {
   const [view, setView] = useState<View>('dashboard')
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -1264,26 +1571,15 @@ export default function IndustrialDashboard() {
       </div>
 
       {/* SCAN-TO-SEARCH MODAL */}
-      {scanOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <Card className="w-full max-w-md shadow-2xl bg-card border-border">
-            <CardHeader className="flex flex-row items-center justify-between pb-3 border-b">
-              <div className="flex items-center gap-2">
-                <QrCode className="size-5 text-primary" />
-                <CardTitle className="text-base font-bold">Scan-to-Search</CardTitle>
-              </div>
-              <Button variant="ghost" size="icon" className="size-7" onClick={() => setScanOpen(false)}><X className="size-4" /></Button>
-            </CardHeader>
-            <CardContent className="pt-4 space-y-4">
-              <p className="text-xs text-muted-foreground">Upload a product image, barcode scan, or datasheet label to automatically search catalog matches.</p>
-              <Input type="file" accept="image/*" className="text-xs" onChange={(e) => setScanFile(e.target.files?.[0] ?? null)} />
-              <Button className="w-full text-xs font-medium" disabled={!scanFile || scanLoading} onClick={() => void handleScanSubmit()}>
-                {scanLoading ? 'Scanning & Parsing...' : 'Run Scan Search'}
-              </Button>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      <ScanSearchModal
+        open={scanOpen}
+        onClose={() => setScanOpen(false)}
+        onSearchResult={(mpn, newJobId) => {
+          if (newJobId) setJobId(newJobId)
+          setSelectedMpn(mpn)
+          go('results')
+        }}
+      />
 
       {/* CART / SAVED PRODUCTS DRAWER */}
       {cartOpen && (

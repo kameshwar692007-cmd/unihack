@@ -39,6 +39,17 @@ class GeminiAttributeExtractor:
             except Exception as e:
                 logger.error(f"Failed to initialize Gemini client: {e}. Using mock mode.")
 
+
+_default_extractor: GeminiAttributeExtractor | None = None
+
+
+def get_gemini_extractor() -> GeminiAttributeExtractor:
+    global _default_extractor
+    if _default_extractor is None:
+        _default_extractor = GeminiAttributeExtractor()
+    return _default_extractor
+
+
     def extract_attributes(
         self,
         product_desc: str,
