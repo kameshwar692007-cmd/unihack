@@ -165,21 +165,26 @@ def get_gemini_extractor() -> GeminiAttributeExtractor:
             for chunk in retrieved_chunks
         ])
 
-        # If client is initialized, call the actual API
+        # If client is initialized, call the actual API with strict timeout
         if self.client:
             try:
+                import concurrent.futures
                 prompt = self._build_prompt(product_desc, mfg_part_num, classpath, allowed_attributes, evidence_text)
                 
-                # Use Gemini 2.5 Flash as standard
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config={
-                        "response_mime_type": "application/json",
-                        "response_schema": ExtractionResponse,
-                        "temperature": 0.0,
-                    }
-                )
+                def _call_gemini():
+                    return self.client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config={
+                            "response_mime_type": "application/json",
+                            "response_schema": ExtractionResponse,
+                            "temperature": 0.0,
+                        }
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_call_gemini)
+                    response = future.result(timeout=2.0)
                 
                 parsed_response = ExtractionResponse.model_validate(json.loads(response.text))
                 allowed = set(allowed_attributes)
@@ -190,7 +195,7 @@ def get_gemini_extractor() -> GeminiAttributeExtractor:
                 logger.info(f"Gemini extracted {len(attributes)} attributes for MPN: {mfg_part_num}")
                 return attributes
             except Exception as e:
-                logger.error(f"Gemini API execution failed ({e}). Falling back to heuristics...")
+                logger.warning(f"Gemini API timed out or failed ({e}). Fast-tracking with heuristic rules...")
 
         # Heuristic fallback (works offline and parses the dishwasher examples perfectly)
         return self._heuristic_extract(mfg_part_num, allowed_attributes, retrieved_chunks)
